@@ -5,17 +5,19 @@ import os
 import argparse
 import logging
 import sys
+import glob
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Split Terraform state by moving resources between modules')
+    parser = argparse.ArgumentParser(description='Split Terraform/Terragrunt state by moving resources between modules')
     parser.add_argument('--source', required=True, help='Source module directory')
     parser.add_argument('--split', action='append', help='Module split mapping in format module=target_dir')
     parser.add_argument('--dry-run', action='store_true', help='Perform a dry run without making changes')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
+    parser.add_argument('--use-terragrunt', action='store_true', help='Use terragrunt instead of terraform')
     
     args = parser.parse_args()
     
@@ -24,15 +26,31 @@ def parse_args():
     
     return args
 
-def pull_state(module_dir):
-    """Pull Terraform state from a module directory"""
+def detect_tool(module_dir, force_terragrunt=False):
+    """Detect whether to use terraform or terragrunt"""
+    if force_terragrunt:
+        logger.debug("Forced to use terragrunt")
+        return "terragrunt"
+    
+    # Check if terragrunt.hcl exists in the directory
+    if glob.glob(os.path.join(module_dir, "*.hcl")):
+        logger.debug(f"Detected terragrunt.hcl in {module_dir}, using terragrunt")
+        return "terragrunt"
+    
+    logger.debug(f"No terragrunt.hcl found in {module_dir}, using terraform")
+    return "terraform"
+
+def pull_state(module_dir, use_terragrunt=False):
+    """Pull Terraform/Terragrunt state from a module directory"""
     try:
         original_dir = os.getcwd()
         os.chdir(module_dir)
         
-        logger.debug(f"Pulling state from {module_dir}")
+        tool = detect_tool(module_dir, force_terragrunt=use_terragrunt)
+        
+        logger.debug(f"Pulling state from {module_dir} using {tool}")
         result = subprocess.run(
-            ['terraform', 'state', 'pull'], 
+            [tool, 'state', 'pull'], 
             capture_output=True, 
             text=True,
             check=True
@@ -47,11 +65,13 @@ def pull_state(module_dir):
     finally:
         os.chdir(original_dir)
 
-def push_state(module_dir, state, force_serial=None):
-    """Push Terraform state to a module directory"""
+def push_state(module_dir, state, force_serial=None, use_terragrunt=False):
+    """Push Terraform/Terragrunt state to a module directory"""
     try:
         original_dir = os.getcwd()
         os.chdir(module_dir)
+        
+        tool = detect_tool(module_dir, force_terragrunt=use_terragrunt)
         
         # Use specified serial number or increment the existing one
         if force_serial is not None:
@@ -59,10 +79,10 @@ def push_state(module_dir, state, force_serial=None):
         else:
             state['serial'] = state.get('serial', 0) + 1
             
-        logger.debug(f"Pushing state to {module_dir} with serial {state['serial']}")
+        logger.debug(f"Pushing state to {module_dir} with serial {state['serial']} using {tool}")
         
         result = subprocess.run(
-            ['terraform', 'state', 'push', '-'],
+            [tool, 'state', 'push', '-'],
             input=json.dumps(state),
             capture_output=True,
             text=True,
@@ -77,50 +97,66 @@ def push_state(module_dir, state, force_serial=None):
     finally:
         os.chdir(original_dir)
 
-def find_module_resources(state, module_prefix):
-    """Find all resources in state that belong to a specific module"""
+def find_module_resources(state, module_name):
+    """Find all resources belonging to a particular module"""
     resources = []
     
-    for resource in state.get('resources', []):
-        if resource.get('module', '').startswith(module_prefix):
-            resources.append(resource)
+    if not state or 'resources' not in state:
+        return resources
     
+    for resource in state.get('resources', []):
+        # Check if the resource belongs to the specified module
+        if resource.get('module', '').startswith(f"module.{module_name}"):
+            resources.append(resource)
+            
     return resources
 
 def get_resource_identifier(resource):
-    """Generate a unique identifier for a resource"""
-    return f"{resource.get('module', '')}.{resource.get('type')}.{resource.get('name')}"
+    """Get a unique identifier for a resource"""
+    mode = resource.get('mode', '')
+    module = resource.get('module', '')
+    type = resource.get('type', '')
+    name = resource.get('name', '')
+    
+    return f"{module}.{mode}.{type}.{name}"
 
-def remove_resources_from_state(state, resources_to_remove):
-    """Remove specified resources from state"""
-    new_resources = []
+def remove_resources_from_state(state, resource_ids):
+    """Remove resources from state by their identifiers"""
+    if not state or 'resources' not in state:
+        return state
+    
+    remaining_resources = []
     
     for resource in state.get('resources', []):
-        # Generate a unique identifier for this resource
         resource_id = get_resource_identifier(resource)
-        
-        if resource_id not in resources_to_remove:
-            new_resources.append(resource)
-        else:
-            logger.debug(f"Removing resource {resource_id} from state")
+        if resource_id not in resource_ids:
+            remaining_resources.append(resource)
     
-    state['resources'] = new_resources
+    state['resources'] = remaining_resources
     return state
 
 def add_resources_to_state(state, resources_to_add):
-    """Add specified resources to state, avoiding duplicates"""
-    # Create a set of existing resource identifiers
-    existing_resources = {
-        get_resource_identifier(resource)
-        for resource in state.get('resources', [])
-    }
+    """Add resources to state, avoiding duplicates"""
+    if not state:
+        state = {"version": 4, "terraform_version": "1.0.0", "serial": 0, "lineage": "", "resources": []}
+        
+    if 'resources' not in state:
+        state['resources'] = []
+        
+    existing_resources = set()
     
-    # Add only non-duplicate resources
+    # Track existing resources to avoid duplicates
+    for resource in state['resources']:
+        resource_id = get_resource_identifier(resource)
+        existing_resources.add(resource_id)
+    
+    # Add new resources, skipping duplicates
     for resource in resources_to_add:
         resource_id = get_resource_identifier(resource)
+        
         if resource_id not in existing_resources:
-            logger.debug(f"Adding resource {resource_id} to state")
             state['resources'].append(resource)
+            logger.debug(f"Adding resource: {resource_id}")
             existing_resources.add(resource_id)
         else:
             logger.warning(f"Skipping duplicate resource: {resource_id}")
@@ -149,7 +185,7 @@ def main():
     logger.info(f"Split mappings: {splits}")
     
     # Pull source state
-    source_state = pull_state(args.source)
+    source_state = pull_state(args.source, args.use_terragrunt)
     original_serial = source_state.get('serial', 0)
     
     # Track resources to remove from source
@@ -169,8 +205,8 @@ def main():
         
         # Pull target state
         try:
-            target_state = pull_state(target_dir)
-        except:
+            target_state = pull_state(target_dir, args.use_terragrunt)
+        except Exception as e:
             logger.error(f"Failed to pull state from target {target_dir}, initializing empty state")
             target_state = {
                 "version": 4, 
@@ -198,25 +234,22 @@ def main():
             # Add to our master list of resources to remove
             all_resources_to_remove.extend(resources_to_remove)
             
-            # Push updated target state
-            logger.info(f"Pushing updated state to {target_dir}")
-            push_state(target_dir, target_state)
+            # Push the updated target state
+            push_state(target_dir, target_state, use_terragrunt=args.use_terragrunt)
     
+    # Remove resources from source state and push it
     if not args.dry_run and all_resources_to_remove:
-        # Pull source state again to ensure we have the latest version
-        source_state = pull_state(args.source)
-        
-        # Remove all resources from source state
+        logger.info(f"Removing {len(all_resources_to_remove)} resources from source state")
         source_state = remove_resources_from_state(source_state, all_resources_to_remove)
         
-        # Force serial to be greater than original
-        new_serial = max(original_serial + 1, source_state.get('serial', 0) + 1)
+        # Force serial to be higher than original to avoid conflicts
+        push_state(args.source, source_state, force_serial=original_serial+1, use_terragrunt=args.use_terragrunt)
         
-        # Push updated source state
-        logger.info(f"Pushing updated state to {args.source} with serial {new_serial}")
-        push_state(args.source, source_state, force_serial=new_serial)
-    
-    logger.info("Terraform state splitting completed")
+        logger.info("State split complete")
+    elif args.dry_run:
+        logger.info("Dry run complete, no changes made")
+    else:
+        logger.info("No resources to move")
 
 if __name__ == "__main__":
     main()
