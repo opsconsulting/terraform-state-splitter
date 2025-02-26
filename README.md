@@ -25,8 +25,8 @@ Terraform State Splitter helps you refactor your Terraform or Terragrunt configu
 No installation is required. Simply clone this repository and run the Python script.
 
 ```bash
-git clone https://github.com/yourusername/TerraformSplitter.git
-cd TerraformSplitter
+git clone https://github.com/opsconsulting/terraform-state-splitter.git
+cd terraform-state-splitter
 ```
 
 ### Requirements
