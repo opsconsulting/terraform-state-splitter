@@ -37,7 +37,7 @@ cd terraform-state-splitter
 ## Usage
 
 ```bash
-./state_splitter.py --source <source_module_directory> --split <module_name>=<target_directory> [--split <module_name>=<target_directory> ...] [options]
+python state_splitter.py --source <source_module_directory> --split <module_name>=<target_directory> [--split <module_name>=<target_directory> ...] [options]
 ```
 
 ### Arguments
@@ -52,13 +52,13 @@ cd terraform-state-splitter
 
 ```bash
 # Move resources from the "networking" module in source to the target directory
-./state_splitter.py --source ./main-infrastructure --split networking=./networking-module
+python state_splitter.py --source ./main-infrastructure --split networking=./networking-module
 
 # Move multiple modules at once
-./state_splitter.py --source ./monolith --split networking=./networking --split database=./database --split compute=./compute
+python state_splitter.py --source ./monolith --split networking=./networking --split database=./database --split compute=./compute
 
 # Perform a dry run to preview changes
-./state_splitter.py --source ./monolith --split database=./database --dry-run
+python state_splitter.py --source ./monolith --split database=./database --dry-run
 ```
 
 ## How It Works
