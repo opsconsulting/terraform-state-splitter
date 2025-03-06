@@ -184,26 +184,57 @@ def add_resources_to_state(state, resources_to_add, source_prefix=None, target_p
     return state
 
 def identify_modules(state):
-    """Identify all modules in the state file"""
-    modules = set()
+    """Identify all modules in the state file with proper hierarchy and direct resource counts"""
+    # Store module information: {module_display_name: {full_path: "", count: 0}}
+    modules = {}
+    # Store resources for each module
     module_resources = defaultdict(list)
     
     if not state or 'resources' not in state:
         return modules, module_resources
     
-    # Regular expression to match module patterns
-    module_pattern = re.compile(r'^module\.([^\.]+)')
-    
+    # First, collect all resources by their module path
+    all_module_paths = set()
     for resource in state.get('resources', []):
         module_path = resource.get('module', '')
         
-        if module_path:
-            # Find all module references in the path
-            match = module_pattern.search(module_path)
-            if match:
-                module_name = match.group(1)
-                modules.add(module_name)
-                module_resources[module_name].append(resource)
+        if module_path and module_path.startswith('module.'):
+            all_module_paths.add(module_path)
+            module_resources[module_path].append(resource)
+    
+    # Process module paths to create display structure
+    for module_path in all_module_paths:
+        # Convert "module.vpc.module.vpc" to "vpc.vpc"
+        parts = module_path.split('.')
+        display_parts = []
+        
+        # Process parts to extract module names (skipping "module" keyword)
+        for i in range(len(parts)):
+            if parts[i] == "module" and i+1 < len(parts):
+                display_parts.append(parts[i+1])
+        
+        # Create the display name for this module
+        display_name = ".".join(display_parts)
+        
+        # Store the mapping with full path and count of direct resources
+        modules[display_name] = {
+            "full_path": module_path,
+            "count": len(module_resources[module_path])
+        }
+    
+    # Now adjust the counts to show only direct resources (not including submodules)
+    for display_name, info in list(modules.items()):
+        module_path = info["full_path"]
+        
+        # Check if there are any submodules
+        for other_path in all_module_paths:
+            # Skip self
+            if other_path == module_path:
+                continue
+                
+            # If this is a submodule, subtract its resource count from the parent
+            if other_path.startswith(module_path + ".module."):
+                modules[display_name]["count"] -= len(module_resources[other_path])
     
     return modules, module_resources
 
@@ -227,9 +258,10 @@ def interactive_select_modules(source_dir, use_terragrunt=False):
     
     # Create module tree for display
     module_tree = Tree("[bold]Available Modules[/bold]")
-    for module in sorted(modules):
-        resource_count = len(module_resources[module])
-        module_tree.add(f"[green]module.{module}[/green] [dim]({resource_count} resources)[/dim]")
+    for display_name, info in sorted(modules.items()):
+        resource_count = info["count"]
+        if resource_count > 0:  # Only show modules with direct resources
+            module_tree.add(f"[green]{display_name}[/green] [dim]({resource_count} direct resources)[/dim]")
     
     console.print(module_tree)
     console.print()
@@ -238,12 +270,21 @@ def interactive_select_modules(source_dir, use_terragrunt=False):
     module_selections = []
     continue_selecting = True
     
-    while continue_selecting:
+    # Create a mapping for user selection
+    selection_map = {}
+    valid_choices = []
+    
+    for display_name, info in sorted(modules.items()):
+        if info["count"] > 0:  # Only include modules with direct resources
+            selection_map[display_name] = info["full_path"]
+            valid_choices.append(display_name)
+    
+    while continue_selecting and valid_choices:
         # Select which module to split
         module_choices = [
-            inquirer.List('module',
+            inquirer.List('display_name',
                         message="Select a module to split",
-                        choices=sorted(modules),
+                        choices=valid_choices,
                         carousel=True)
         ]
         
@@ -251,12 +292,17 @@ def interactive_select_modules(source_dir, use_terragrunt=False):
         if not module_answers:
             break  # User pressed Ctrl+C
             
-        selected_module = module_answers['module']
+        selected_display = module_answers['display_name']
+        selected_module_path = selection_map[selected_display]
+        
+        # Extract the last segment of the display name for default target dir name
+        default_dir_name = selected_display.split('.')[-1]
         
         # Ask for target directory
         target_dir_question = [
             inquirer.Text('target_dir',
-                        message=f"Enter target directory for module.{selected_module}")
+                        message=f"Enter target directory for {selected_display}",
+                        default=f"./{default_dir_name}")
         ]
         
         target_dir_answer = inquirer.prompt(target_dir_question)
@@ -265,12 +311,11 @@ def interactive_select_modules(source_dir, use_terragrunt=False):
             
         target_dir = target_dir_answer['target_dir']
         
-        # Ask for target prefix
-        source_prefix = f"module.{selected_module}"
+        # Ask for target prefix - default is the same full path
         target_prefix_question = [
             inquirer.Text('target_prefix',
-                         message=f"Enter target prefix for {source_prefix} (leave empty to keep as-is)",
-                         default=source_prefix)
+                         message=f"Enter target prefix (e.g., module.{selected_display})",
+                         default=selected_module_path)
         ]
         
         target_prefix_answer = inquirer.prompt(target_prefix_question)
@@ -281,16 +326,17 @@ def interactive_select_modules(source_dir, use_terragrunt=False):
         
         # Add selection to our list
         module_selections.append({
-            'module': selected_module,
-            'source_prefix': source_prefix,
+            'display_name': selected_display,
+            'module_path': selected_module_path,
+            'source_prefix': selected_module_path,
             'target_prefix': target_prefix,
             'target_dir': target_dir
         })
         
-        # Remove selected module from available modules
-        modules.remove(selected_module)
+        # Remove selected module from available choices
+        valid_choices.remove(selected_display)
         
-        if not modules:
+        if not valid_choices:
             console.print("[yellow]All modules have been selected.[/yellow]")
             break
             
@@ -309,12 +355,35 @@ def interactive_select_modules(source_dir, use_terragrunt=False):
     if module_selections:
         console.print("\n[bold cyan]Module Split Summary:[/bold cyan]")
         for selection in module_selections:
+            display_name = selection['display_name']
             if selection['source_prefix'] == selection['target_prefix']:
-                console.print(f"  • [green]{selection['source_prefix']}[/green] → [blue]{selection['target_dir']}[/blue]")
+                console.print(f"  • [green]{display_name}[/green] → [blue]{selection['target_dir']}[/blue]")
             else:
-                console.print(f"  • [green]{selection['source_prefix']}[/green] → [yellow]{selection['target_prefix']}[/yellow] in [blue]{selection['target_dir']}[/blue]")
+                source_display = selection['source_prefix']
+                target_display = selection['target_prefix']
+                console.print(f"  • [green]{display_name}[/green] [dim]({source_display} → {target_display})[/dim] in [blue]{selection['target_dir']}[/blue]")
     
     return module_selections
+
+def find_resources_by_module_path(state, module_path, exclude_submodules=True):
+    """Find all resources belonging to a particular module path"""
+    resources = []
+    
+    if not state or 'resources' not in state:
+        return resources
+    
+    for resource in state.get('resources', []):
+        resource_module = resource.get('module', '')
+        
+        # If excluding submodules, match only the exact module path
+        if exclude_submodules:
+            if resource_module == module_path:
+                resources.append(resource)
+        # Otherwise match the module path prefix
+        elif resource_module.startswith(module_path):
+            resources.append(resource)
+            
+    return resources
 
 def main():
     args = parse_args()
@@ -329,11 +398,11 @@ def main():
         splits = {}
         module_prefixes = {}
         for selection in selections:
-            module_name = selection['module']
-            splits[module_name] = selection['target_dir']
+            module_path = selection['module_path']
+            splits[module_path] = selection['target_dir']
             
             if selection['source_prefix'] != selection['target_prefix']:
-                module_prefixes[module_name] = {
+                module_prefixes[module_path] = {
                     'source': selection['source_prefix'],
                     'target': selection['target_prefix']
                 }
@@ -351,7 +420,9 @@ def main():
                 sys.exit(1)
             
             module_name, target_dir = parts
-            splits[module_name] = target_dir
+            # In non-interactive mode, construct full module path
+            module_path = f"module.{module_name}"
+            splits[module_path] = target_dir
         
         # No prefix changes in non-interactive mode
         module_prefixes = {}
@@ -367,15 +438,15 @@ def main():
     all_resources_to_remove = []
     
     # Process each module and target
-    for module_name, target_dir in splits.items():
-        logger.info(f"Processing module {module_name} -> {target_dir}")
+    for module_path, target_dir in splits.items():
+        logger.info(f"Processing module {module_path} -> {target_dir}")
         
         # Find resources for this module
-        module_resources = find_module_resources(source_state, module_name)
-        logger.info(f"Found {len(module_resources)} resources for module {module_name}")
+        module_resources = find_resources_by_module_path(source_state, module_path)
+        logger.info(f"Found {len(module_resources)} resources for module {module_path}")
         
         if not module_resources:
-            logger.warning(f"No resources found for module {module_name}")
+            logger.warning(f"No resources found for module {module_path}")
             continue
         
         # Pull target state
@@ -395,9 +466,9 @@ def main():
             logger.info(f"DRY RUN: Would move {len(module_resources)} resources from {args.source} to {target_dir}")
             
             # Check if we have a prefix change for this module
-            if module_name in module_prefixes:
-                source_prefix = module_prefixes[module_name]['source']
-                target_prefix = module_prefixes[module_name]['target']
+            if module_path in module_prefixes:
+                source_prefix = module_prefixes[module_path]['source']
+                target_prefix = module_prefixes[module_path]['target']
                 logger.info(f"  With prefix change: {source_prefix} -> {target_prefix}")
                 
             for resource in module_resources:
@@ -413,9 +484,9 @@ def main():
             # Check if we have a prefix change for this module
             source_prefix = None
             target_prefix = None
-            if module_name in module_prefixes:
-                source_prefix = module_prefixes[module_name]['source']
-                target_prefix = module_prefixes[module_name]['target']
+            if module_path in module_prefixes:
+                source_prefix = module_prefixes[module_path]['source']
+                target_prefix = module_prefixes[module_path]['target']
             
             # Add resources to target state with possible prefix change
             target_state = add_resources_to_state(
