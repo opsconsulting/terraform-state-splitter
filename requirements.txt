@@ -1,0 +1,3 @@
+# Core dependencies
+inquirer>=2.10.0
+rich>=13.0.0 
