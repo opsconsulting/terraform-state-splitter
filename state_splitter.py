@@ -34,6 +34,7 @@ def parse_args():
     parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
     parser.add_argument('--use-terragrunt', action='store_true', help='Use terragrunt instead of terraform')
     parser.add_argument('--interactive', action='store_true', help='Use interactive mode to select modules and set target prefixes')
+    parser.add_argument('--remove-split-resources', action='store_true', help='Remove resources listed in .last_split.json from the source state')
     
     args = parser.parse_args()
     
@@ -398,6 +399,43 @@ def main():
     import shutil
     args = parse_args()
     
+    # Handle remove-split-resources mode
+    if args.remove_split_resources:
+        split_info_path = os.path.join(args.source, '.last_split.json')
+        state_file_path = os.path.join(args.source, 'terraform.tfstate')
+        backup_file_path = os.path.join(args.source, 'terraform.tfstate.backup')
+        # Backup state before modifying
+        try:
+            if os.path.exists(state_file_path):
+                shutil.copy2(state_file_path, backup_file_path)
+                logger.info(f"Backed up state file to {backup_file_path}")
+            else:
+                logger.warning(f"State file {state_file_path} not found for backup.")
+        except Exception as e:
+            logger.error(f"Failed to backup state file: {e}")
+        # Read split info
+        if not os.path.exists(split_info_path):
+            logger.error(f"Split info file {split_info_path} not found. Cannot remove resources.")
+            sys.exit(1)
+        try:
+            with open(split_info_path, 'r') as f:
+                split_info = json.load(f)
+            resource_ids = split_info.get('resource_ids', [])
+            if not resource_ids:
+                logger.error(f"No resource_ids found in {split_info_path}. Nothing to remove.")
+                sys.exit(1)
+        except Exception as e:
+            logger.error(f"Failed to read or parse {split_info_path}: {e}")
+            sys.exit(1)
+        # Pull state
+        source_state = pull_state(args.source, args.use_terragrunt)
+        original_serial = source_state.get('serial', 0)
+        logger.info(f"Removing {len(resource_ids)} resources from source state as listed in {split_info_path}")
+        source_state = remove_resources_from_state(source_state, resource_ids)
+        push_state(args.source, source_state, force_serial=original_serial+1, use_terragrunt=args.use_terragrunt)
+        logger.info("Resources removed from source state. Operation complete.")
+        return
+
     if args.interactive:
         selections, remove_now = interactive_select_modules(args.source, args.use_terragrunt)
         if not selections:
