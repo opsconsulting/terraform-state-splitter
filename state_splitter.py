@@ -254,7 +254,7 @@ def interactive_select_modules(source_dir, use_terragrunt=False):
     
     if not modules:
         console.print("[yellow]No modules found in the source state.[/yellow]")
-        return {}
+        return {}, None
     
     # Create module tree for display
     module_tree = Tree("[bold]Available Modules[/bold]")
@@ -363,7 +363,16 @@ def interactive_select_modules(source_dir, use_terragrunt=False):
                 target_display = selection['target_prefix']
                 console.print(f"  • [green]{display_name}[/green] [dim]({source_display} → {target_display})[/dim] in [blue]{selection['target_dir']}[/blue]")
     
-    return module_selections
+    # Ask if user wants to remove resources from source state now
+    remove_now_question = [
+        inquirer.Confirm('remove_now',
+                         message="Do you want to remove the split resources from the source state now?",
+                         default=False)
+    ]
+    remove_now_answer = inquirer.prompt(remove_now_question)
+    remove_now = remove_now_answer and remove_now_answer.get('remove_now', False)
+    
+    return module_selections, remove_now
 
 def find_resources_by_module_path(state, module_path, exclude_submodules=True):
     """Find all resources belonging to a particular module path"""
@@ -386,10 +395,11 @@ def find_resources_by_module_path(state, module_path, exclude_submodules=True):
     return resources
 
 def main():
+    import shutil
     args = parse_args()
     
     if args.interactive:
-        selections = interactive_select_modules(args.source, args.use_terragrunt)
+        selections, remove_now = interactive_select_modules(args.source, args.use_terragrunt)
         if not selections:
             logger.error("No modules selected for splitting.")
             sys.exit(1)
@@ -433,6 +443,18 @@ def main():
     # Pull source state
     source_state = pull_state(args.source, args.use_terragrunt)
     original_serial = source_state.get('serial', 0)
+    
+    # Backup the state file
+    state_file_path = os.path.join(args.source, 'terraform.tfstate')
+    backup_file_path = os.path.join(args.source, 'terraform.tfstate.backup')
+    try:
+        if os.path.exists(state_file_path):
+            shutil.copy2(state_file_path, backup_file_path)
+            logger.info(f"Backed up state file to {backup_file_path}")
+        else:
+            logger.warning(f"State file {state_file_path} not found for backup.")
+    except Exception as e:
+        logger.error(f"Failed to backup state file: {e}")
     
     # Track resources to remove from source
     all_resources_to_remove = []
@@ -502,15 +524,26 @@ def main():
             # Push the updated target state
             push_state(target_dir, target_state, use_terragrunt=args.use_terragrunt)
     
-    # Remove resources from source state and push it
+    # Remove resources from source state and push it, or save split info if not removing now
     if not args.dry_run and all_resources_to_remove:
-        logger.info(f"Removing {len(all_resources_to_remove)} resources from source state")
-        source_state = remove_resources_from_state(source_state, all_resources_to_remove)
-        
-        # Force serial to be higher than original to avoid conflicts
-        push_state(args.source, source_state, force_serial=original_serial+1, use_terragrunt=args.use_terragrunt)
-        
-        logger.info("State split complete")
+        if args.interactive and remove_now is not None and not remove_now:
+            # Save split info to .last_split.json
+            split_info_path = os.path.join(args.source, '.last_split.json')
+            try:
+                with open(split_info_path, 'w') as f:
+                    json.dump({"resource_ids": all_resources_to_remove}, f, indent=2)
+                logger.info(f"Saved split resource info to {split_info_path}")
+            except Exception as e:
+                logger.error(f"Failed to save split info: {e}")
+            logger.info("Resources NOT removed from source state. You can remove them later using the saved split info.")
+        else:
+            logger.info(f"Removing {len(all_resources_to_remove)} resources from source state")
+            source_state = remove_resources_from_state(source_state, all_resources_to_remove)
+            
+            # Force serial to be higher than original to avoid conflicts
+            push_state(args.source, source_state, force_serial=original_serial+1, use_terragrunt=args.use_terragrunt)
+            
+            logger.info("State split complete")
     elif args.dry_run:
         logger.info("Dry run complete, no changes made")
 
